@@ -4,6 +4,8 @@ import type { Message, ToolCall } from "@/types/message";
 
 interface Props {
   messages: Message[];
+  /** When true, skip auto-scroll to bottom (e.g. while loading older pages). */
+  suppressAutoScroll?: boolean;
 }
 
 interface GroupedMessage extends Message {
@@ -11,63 +13,76 @@ interface GroupedMessage extends Message {
 }
 
 /**
- * Groups consecutive tool messages into the next assistant message.
- * The backend stores: tool, tool, tool, ..., assistant (final response).
- * Tool messages become compact collapsible blocks above the assistant's text.
+ * Groups tool messages with the PRECEDING assistant message.
+ * The backend stores: assistant (reasoning + tool requests), tool, tool, ...
+ * Tool results become compact collapsible blocks under the assistant's text.
  */
 function groupMessages(messages: Message[]): GroupedMessage[] {
   const grouped: GroupedMessage[] = [];
-  let pendingTools: ToolCall[] = [];
 
   for (const msg of messages) {
     if (msg.role === "tool") {
-      // Buffer tool messages — they'll attach to the next assistant message
-      pendingTools.push({
-        id: msg.id || msg.message_id || crypto.randomUUID(),
-        name: msg.tool_name || "tool",
-        input: msg.tool_input || {},
-        output: msg.tool_output || msg.content,
-        status: "completed",
-      });
-      continue;
-    }
-
-    if (msg.role === "assistant" && pendingTools.length > 0) {
-      // Attach buffered tool calls to this assistant message
-      grouped.push({
-        ...msg,
-        attached_tool_calls: [...pendingTools],
-      });
-      pendingTools = [];
+      // Attach to the last assistant message in the grouped list
+      const last = grouped[grouped.length - 1];
+      if (last && last.role === "assistant") {
+        if (!last.attached_tool_calls) {
+          last.attached_tool_calls = [];
+        }
+        last.attached_tool_calls.push({
+          id: msg.id || msg.message_id || crypto.randomUUID(),
+          name: msg.tool_name || "tool",
+          input: msg.tool_input || {},
+          output: msg.tool_output || msg.content,
+          status: "completed",
+        });
+      } else {
+        // Orphan tool message with no preceding assistant — render as
+        // a synthetic assistant message with just tool calls
+        grouped.push({
+          id: `synthetic-${msg.id}`,
+          session_id: msg.session_id,
+          role: "assistant",
+          content: "",
+          created_at: msg.created_at,
+          attached_tool_calls: [
+            {
+              id: msg.id || msg.message_id || crypto.randomUUID(),
+              name: msg.tool_name || "tool",
+              input: msg.tool_input || {},
+              output: msg.tool_output || msg.content,
+              status: "completed",
+            },
+          ],
+        });
+      }
       continue;
     }
 
     grouped.push({ ...msg });
   }
 
-  // If there are trailing tool messages with no following assistant message,
-  // render them as a synthetic assistant message with just tool calls
-  if (pendingTools.length > 0) {
-    grouped.push({
-      id: "pending-tools",
-      session_id: "",
-      role: "assistant",
-      content: "",
-      created_at: new Date().toISOString(),
-      attached_tool_calls: pendingTools,
-    });
-  }
-
   return grouped;
 }
 
-export function MessageList({ messages }: Props) {
+export function MessageList({ messages, suppressAutoScroll }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const prevLastIdRef = useRef<string | null>(null);
 
+  // Auto-scroll only when the LAST message changes (new message at the bottom),
+  // not when older messages are prepended at the top.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, messages[messages.length - 1]?.content]);
+    const lastMsg = messages[messages.length - 1];
+    const lastId = lastMsg?.id || lastMsg?.message_id || null;
+    if (suppressAutoScroll) {
+      prevLastIdRef.current = lastId;
+      return;
+    }
+    if (lastId !== prevLastIdRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+    prevLastIdRef.current = lastId;
+  }, [messages, suppressAutoScroll]);
 
   const grouped = groupMessages(messages);
 

@@ -30,6 +30,7 @@ export type WebSocketEventType =
   | "tool_call"
   | "tool_result"
   | "token"
+  | "assistant_message"
   | "done"
   | "error";
 

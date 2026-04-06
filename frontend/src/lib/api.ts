@@ -88,8 +88,20 @@ export function deleteSession(id: string): Promise<void> {
 }
 
 // Messages
-export function getMessages(sessionId: string): Promise<{ messages: Message[]; count: number; last_key: string | null }> {
-  return request(`/sessions/${sessionId}/messages`);
+export interface MessagePage {
+  messages: Message[];
+  count: number;
+  last_key: string | null;
+}
+
+export function getMessages(
+  sessionId: string,
+  opts?: { limit?: number; lastKey?: string },
+): Promise<MessagePage> {
+  const limit = opts?.limit ?? 50;
+  const params = new URLSearchParams({ limit: String(limit), newest_first: "true" });
+  if (opts?.lastKey) params.set("last_key", opts.lastKey);
+  return request(`/sessions/${sessionId}/messages?${params}`);
 }
 
 // Jobs

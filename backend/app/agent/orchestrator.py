@@ -277,6 +277,12 @@ class AgentOrchestrator:
             if text_content:
                 await self._emit(on_event, "token", {"content": text_content})
 
+            # Persist the intermediate assistant message BEFORE tool results
+            # so the DB ordering is: assistant, tool, tool — the frontend's
+            # groupMessages() attaches tool results to the PRECEDING assistant.
+            mid = _ulid()
+            await self._persist_assistant_message(text_content, response, message_id=mid)
+
             # Execute each tool call
             for tc in tool_calls:
                 await self._emit(on_event, "tool_call", {
@@ -297,6 +303,23 @@ class AgentOrchestrator:
 
                 # Persist tool call + result as messages
                 await self._persist_tool_message(tc, result, response)
+
+            # Emit "assistant_message" so the frontend can commit the
+            # intermediate message (with its tool calls) into the message list
+            # and clear streaming state for the next iteration.
+            await self._emit(on_event, "assistant_message", {
+                "message": {
+                    "id": mid,
+                    "session_id": self.session_id,
+                    "role": "assistant",
+                    "content": text_content,
+                    "model": self.model,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "cost_usd": response.cost_usd,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            })
 
             # Save state after each iteration for crash recovery
             await self.save_state()
@@ -406,12 +429,18 @@ class AgentOrchestrator:
             max_tokens=4_096,
         )
 
-    async def _persist_assistant_message(self, text: str, response: Any) -> None:
-        """Write the final assistant text message to the messages table."""
+    async def _persist_assistant_message(
+        self, text: str, response: Any, message_id: str | None = None,
+    ) -> str:
+        """Write an assistant text message to the messages table.
+
+        Returns the message ID used.
+        """
+        mid = message_id or _ulid()
         try:
             msg = MessageItem(
                 session_id=self.session_id,
-                message_id=_ulid(),
+                message_id=mid,
                 role=MessageRole.ASSISTANT,
                 content=text,
                 model=self.model,
@@ -422,6 +451,7 @@ class AgentOrchestrator:
             await dynamo.put_item(TABLE_MESSAGES, msg.to_dynamo_item())
         except Exception:
             logger.exception("Failed to persist assistant message")
+        return mid
 
     async def _persist_tool_message(self, tool_call: Any, result: str, response: Any) -> None:
         """Write a tool invocation record to the messages table."""

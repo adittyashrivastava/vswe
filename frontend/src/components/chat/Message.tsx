@@ -24,11 +24,16 @@ export function Message({ message, attachedToolCalls }: Props) {
     );
   }
 
-  // Merge tool_calls from both sources (live WebSocket + history grouping)
-  const allToolCalls = [
-    ...(attachedToolCalls || []),
-    ...(message.tool_calls || []),
-  ];
+  // Merge tool_calls from both sources (live WebSocket + history grouping),
+  // deduplicating by ID to prevent double-rendering during live sessions.
+  const seenIds = new Set<string>();
+  const allToolCalls: ToolCall[] = [];
+  for (const tc of [...(message.tool_calls || []), ...(attachedToolCalls || [])]) {
+    if (!seenIds.has(tc.id)) {
+      seenIds.add(tc.id);
+      allToolCalls.push(tc);
+    }
+  }
 
   const hasContent = message.content && message.content.trim();
   return (
@@ -48,16 +53,7 @@ export function Message({ message, attachedToolCalls }: Props) {
 
       {/* Content */}
       <div className={`max-w-[75%] space-y-2 ${isUser ? "items-end" : "items-start"}`}>
-        {/* Tool calls — compact collapsible blocks above the text */}
-        {!isUser && allToolCalls.length > 0 && (
-          <div className="space-y-1">
-            {allToolCalls.map((tc) => (
-              <ToolCallBlock key={tc.id} toolCall={tc} />
-            ))}
-          </div>
-        )}
-
-        {/* Message text */}
+        {/* Message text (reasoning) — shown before tool calls */}
         {hasContent && (
           <div
             className={`rounded-lg px-3.5 py-2.5 text-sm leading-relaxed ${
@@ -70,6 +66,14 @@ export function Message({ message, attachedToolCalls }: Props) {
           </div>
         )}
 
+        {/* Tool calls — compact collapsible blocks below the reasoning */}
+        {!isUser && allToolCalls.length > 0 && (
+          <div className="space-y-1">
+            {allToolCalls.map((tc) => (
+              <ToolCallBlock key={tc.id} toolCall={tc} />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

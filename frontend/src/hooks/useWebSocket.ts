@@ -74,9 +74,30 @@ export function useWebSocket(sessionId: string | undefined): UseWebSocketReturn 
           }
           break;
 
+        case "assistant_message":
+          // Intermediate assistant message — commit it (with accumulated
+          // tool calls) into the message list and reset streaming state
+          // so the next iteration starts clean.
+          if (event.data.message) {
+            setCompletedToolCalls((prevCompleted) => {
+              setActiveToolCalls((prevActive) => {
+                const allToolCalls = [...prevCompleted, ...prevActive];
+                const msg = event.data.message!;
+                if (allToolCalls.length > 0) {
+                  msg.tool_calls = allToolCalls;
+                }
+                setMessages((prev) => [...prev, msg]);
+                return [];
+              });
+              return [];
+            });
+          }
+          setStreamingContent("");
+          break;
+
         case "done":
           if (event.data.message) {
-            // Attach all tool calls from this response to the message
+            // Attach any remaining tool calls to the final message
             setCompletedToolCalls((prevCompleted) => {
               setActiveToolCalls((prevActive) => {
                 const allToolCalls = [...prevCompleted, ...prevActive];

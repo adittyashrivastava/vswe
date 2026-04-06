@@ -72,6 +72,21 @@ export class WebSocketManager {
               error: raw.error,
             };
             break;
+          case "assistant_message":
+            normalized.data.message = raw.message
+              ? {
+                  id: raw.message.id || crypto.randomUUID(),
+                  session_id: raw.message.session_id || this.sessionId || "",
+                  role: "assistant",
+                  content: raw.message.content || "",
+                  model: raw.message.model,
+                  input_tokens: raw.message.input_tokens,
+                  output_tokens: raw.message.output_tokens,
+                  cost_usd: raw.message.cost_usd,
+                  created_at: raw.message.created_at || raw.timestamp || new Date().toISOString(),
+                }
+              : undefined;
+            break;
           case "done":
             normalized.data.content = raw.content;
             normalized.data.message = {

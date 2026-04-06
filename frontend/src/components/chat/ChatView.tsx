@@ -1,6 +1,7 @@
+import { useCallback, useRef } from "react";
 import { useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { MessageSquare } from "lucide-react";
+import { useInfiniteQuery } from "@tanstack/react-query";
+import { MessageSquare, Loader2 } from "lucide-react";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { getMessages } from "@/lib/api";
 import { MessageList } from "./MessageList";
@@ -13,6 +14,7 @@ import type { Message } from "@/types/message";
 
 export function ChatView() {
   const { sessionId } = useParams<{ sessionId: string }>();
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const {
     sendMessage,
     messages: wsMessages,
@@ -24,19 +26,50 @@ export function ChatView() {
     isProcessing,
   } = useWebSocket(sessionId);
 
-  // Load existing messages for the session
-  const { data: existingMessages } = useQuery({
+  // Load existing messages with reverse-chronological pagination.
+  // Each "page" returns the next batch of older messages (in chronological order).
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteQuery({
     queryKey: ["messages", sessionId],
-    queryFn: () => getMessages(sessionId!),
+    queryFn: ({ pageParam }) =>
+      getMessages(sessionId!, { limit: 50, lastKey: pageParam ?? undefined }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.last_key,
     enabled: !!sessionId,
   });
 
-  // Combine loaded messages with live messages
-  const loadedMessages = existingMessages?.messages || existingMessages || [];
-  const allMessages: Message[] = [
-    ...(Array.isArray(loadedMessages) ? loadedMessages : []),
-    ...wsMessages,
-  ];
+  // Pages come in reverse-chronological order (newest page first).
+  // Flatten: older pages first, then newer pages, then live WS messages.
+  const loadedMessages: Message[] = data
+    ? data.pages
+        .slice()
+        .reverse()
+        .flatMap((page) => page.messages)
+    : [];
+
+  const allMessages: Message[] = [...loadedMessages, ...wsMessages];
+
+  // Scroll-up handler: load older messages when the user scrolls to the top.
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    if (el.scrollTop < 80 && hasNextPage && !isFetchingNextPage) {
+      // Remember scroll height before prepending so we can restore position.
+      const prevHeight = el.scrollHeight;
+      fetchNextPage().then(() => {
+        requestAnimationFrame(() => {
+          if (scrollContainerRef.current) {
+            scrollContainerRef.current.scrollTop =
+              scrollContainerRef.current.scrollHeight - prevHeight;
+          }
+        });
+      });
+    }
+  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
   if (!sessionId) {
     return (
@@ -69,14 +102,44 @@ export function ChatView() {
       </div>
 
       {/* Messages + live activity */}
-      <div className="flex-1 overflow-y-auto">
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-y-auto"
+        onScroll={handleScroll}
+      >
         <div className="max-w-3xl mx-auto px-4 py-4 space-y-3">
+          {/* Loading-older indicator */}
+          {isFetchingNextPage && (
+            <div className="flex justify-center py-2">
+              <Loader2 className="w-5 h-5 text-gray-500 animate-spin" />
+            </div>
+          )}
+
+          {hasNextPage && !isFetchingNextPage && (
+            <div className="flex justify-center py-1">
+              <span className="text-xs text-gray-600">Scroll up to load older messages</span>
+            </div>
+          )}
+
           {/* Rendered messages (including tool calls attached to assistant messages) */}
-          <MessageList messages={allMessages} />
+          <MessageList messages={allMessages} suppressAutoScroll={isFetchingNextPage} />
 
           {/* Live area — shows while agent is processing */}
           {isProcessing && (
             <div className="space-y-2">
+              {/* Streaming text content (reasoning) — shown first */}
+              {streamingContent && (
+                <div className="flex gap-3">
+                  <div className="flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center bg-gray-700">
+                    <span className="text-xs text-gray-300">AI</span>
+                  </div>
+                  <div className="max-w-[75%] rounded-lg px-3.5 py-2.5 text-sm leading-relaxed bg-gray-800 text-gray-200 border border-gray-700/50">
+                    <div className="whitespace-pre-wrap break-words">{streamingContent}</div>
+                    <span className="inline-block w-1.5 h-4 bg-blue-400 animate-pulse ml-0.5" />
+                  </div>
+                </div>
+              )}
+
               {/* Completed tool calls from current response */}
               {completedToolCalls.length > 0 && (
                 <div className="ml-10 space-y-1">
@@ -99,19 +162,6 @@ export function ChatView() {
               {statusText && (
                 <div className="ml-10">
                   <StepIndicator text={statusText} />
-                </div>
-              )}
-
-              {/* Streaming text content */}
-              {streamingContent && (
-                <div className="flex gap-3">
-                  <div className="flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center bg-gray-700">
-                    <span className="text-xs text-gray-300">AI</span>
-                  </div>
-                  <div className="max-w-[75%] rounded-lg px-3.5 py-2.5 text-sm leading-relaxed bg-gray-800 text-gray-200 border border-gray-700/50">
-                    <div className="whitespace-pre-wrap break-words">{streamingContent}</div>
-                    <span className="inline-block w-1.5 h-4 bg-blue-400 animate-pulse ml-0.5" />
-                  </div>
                 </div>
               )}
             </div>

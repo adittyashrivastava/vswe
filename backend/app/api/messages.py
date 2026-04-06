@@ -49,8 +49,15 @@ async def list_messages(
     session_id: str,
     limit: int = Query(50, ge=1, le=200),
     last_key: str | None = Query(None, description="Pagination cursor from previous response"),
+    newest_first: bool = Query(True, description="When true, fetch the most recent messages first"),
 ):
-    """Return paginated message history for a session (oldest first)."""
+    """Return paginated message history for a session.
+
+    By default fetches the **newest** messages (``newest_first=true``).
+    Results are always returned in chronological order (oldest first)
+    so the frontend can render top-to-bottom. Pass ``last_key`` from a
+    previous response to load the next page of *older* messages.
+    """
     session = await get_item(TABLE_SESSIONS, {"session_id": session_id, "SK": "META"})
     if not session:
         raise HTTPException(
@@ -64,8 +71,14 @@ async def list_messages(
         key_value=session_id,
         limit=limit,
         last_key=last_key,
-        scan_forward=True,
+        scan_forward=not newest_first,
     )
+
+    # When scanning backwards we get newest-first; reverse so the
+    # response is always in chronological (oldest-first) order.
+    if newest_first:
+        items.reverse()
+
     messages = [MessageOut(**item) for item in items]
     return MessageListResponse(
         messages=messages,
