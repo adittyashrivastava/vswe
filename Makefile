@@ -20,7 +20,16 @@ format:
 	cd frontend && npm run format
 
 deploy:
-	cd infrastructure/cdk && cdk deploy --all
+	cd infrastructure/cdk && source .venv/bin/activate && pip install -q -r requirements.txt && cdk deploy --all
+	@echo "Waiting for ECS deployment to stabilize..."
+	@SERVICE=$$(aws ecs list-services --cluster vswe-cluster --query 'serviceArns[0]' --output text 2>/dev/null) && \
+	if [ -n "$$SERVICE" ] && [ "$$SERVICE" != "None" ]; then \
+		while [ "$$(aws ecs describe-services --cluster vswe-cluster --services $$SERVICE --query 'services[0].deployments | length(@)' --output text 2>/dev/null)" != "1" ]; do \
+			echo "  ECS rollout in progress..."; \
+			sleep 10; \
+		done; \
+		echo "ECS deployment complete — safe to test."; \
+	fi
 
 destroy:
 	cd infrastructure/cdk && cdk destroy --all

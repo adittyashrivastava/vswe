@@ -43,12 +43,12 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         max_context=200_000,
         supports_tools=True,
     ),
-    "claude-3-haiku-20250307": ModelInfo(
-        id="claude-3-haiku-20250307",
+    "claude-haiku-4-5-20251001": ModelInfo(
+        id="claude-haiku-4-5-20251001",
         provider="anthropic",
-        display_name="Claude 3 Haiku",
-        input_price_per_1k=0.00025,
-        output_price_per_1k=0.00125,
+        display_name="Claude 4.5 Haiku",
+        input_price_per_1k=0.001,
+        output_price_per_1k=0.005,
         max_context=200_000,
         supports_tools=True,
     ),

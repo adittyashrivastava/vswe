@@ -134,6 +134,7 @@ _READ_ONLY_TOOL_NAMES: set[str] = {
     "list_files",
     "clone_repo",
     "run_command",
+    "get_job_status",
 }
 
 _WRITE_TOOL_NAMES: set[str] = _READ_ONLY_TOOL_NAMES | {
@@ -142,6 +143,8 @@ _WRITE_TOOL_NAMES: set[str] = _READ_ONLY_TOOL_NAMES | {
     "create_branch",
     "commit_and_push",
     "create_pull_request",
+    "submit_training_job",
+    "get_job_status",
 }
 
 

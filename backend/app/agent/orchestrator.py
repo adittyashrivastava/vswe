@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
 from app.agent.context import ConversationContext
+from app.agent.phases import AgentPhase, get_tools_for_phase_and_permission
 from app.agent.permissions import (
     PERMISSION_PROMPT_SNIPPETS,
     RepoPermissions,
@@ -106,6 +107,10 @@ class AgentOrchestrator:
         self._accessible_repos: list[str] | None = None
         self._turn_counter: int = 0
         self._current_turn_id: str | None = None
+        # Phase-gated workflow state — both chat and GitHub issue sessions
+        # go through CLARIFY → PLAN_REVIEW → EXECUTE
+        self._phase: AgentPhase = AgentPhase.CLARIFY
+        self._pending_plan: str | None = None
 
     # -- permissions --------------------------------------------------------
 
@@ -201,17 +206,22 @@ class AgentOrchestrator:
         streaming to a WebSocket.
 
         Event types:
-        - ``"status"``      — informational status updates
-        - ``"tool_call"``   — the LLM wants to invoke a tool
-        - ``"tool_result"`` — a tool finished executing
-        - ``"token"``       — streamed text token from the LLM
-        - ``"done"``        — final text response from the LLM
+        - ``"status"``        — informational status updates
+        - ``"tool_call"``     — the LLM wants to invoke a tool
+        - ``"tool_result"``   — a tool finished executing
+        - ``"token"``         — streamed text token from the LLM
+        - ``"plan_review"``   — agent submitted a plan; waiting for approval
+        - ``"done"``          — final text response from the LLM
 
         Returns the final assistant text response.
         """
         self._turn_counter += 1
         self._current_turn_id = f"turn_{self._turn_counter:03d}"
         self._context.mark_new_iteration()
+
+        # -- Handle plan approval / rejection when in PLAN_REVIEW phase --------
+        if self._phase == AgentPhase.PLAN_REVIEW:
+            user_message = self._handle_plan_review_input(user_message)
 
         self._context.add_user_message(user_message)
 
@@ -233,10 +243,20 @@ class AgentOrchestrator:
         while iteration < _MAX_ITERATIONS:
             iteration += 1
 
+            # Compact old tool results BEFORE calling the LLM so that the
+            # cache breakpoint is placed on already-compacted content.
+            # If compaction ran after the LLM call, it would mutate the
+            # cached prefix and cause a cache miss on the next iteration.
+            self._context.compact_tool_results(self.workspace_path)
+
             # Truncate context if it is getting too large
             self._context.truncate_if_needed(_MAX_CONTEXT_TOKENS)
 
             # Call the LLM
+            logger.info(
+                "Calling LLM: session=%s phase=%s iteration=%d",
+                self.session_id, self._phase.value, iteration,
+            )
             response = await self._call_llm()
 
             text_content = response.content
@@ -270,8 +290,57 @@ class AgentOrchestrator:
             if not tool_calls:
                 await self._emit(on_event, "done", {"content": text_content})
                 await self._persist_assistant_message(text_content, response)
+                # If we just finished executing, reset to CLARIFY for the
+                # next user message.
+                if self._phase == AgentPhase.EXECUTE:
+                    self._phase = AgentPhase.CLARIFY
+                    self._pending_plan = None
                 await self.save_state()
                 return text_content
+
+            # -- Check for submit_plan tool call (phase transition) ------------
+            submit_plan_tc = next(
+                (tc for tc in tool_calls if tc.name == "submit_plan"), None,
+            )
+            if submit_plan_tc is not None:
+                plan_text = submit_plan_tc.arguments.get("plan", "")
+                self._pending_plan = plan_text
+                self._phase = AgentPhase.PLAN_REVIEW
+
+                # Add a synthetic tool result so the context stays valid
+                self._context.add_tool_result(
+                    submit_plan_tc.id,
+                    "Plan submitted. Waiting for user approval.",
+                )
+
+                # Stream any text the assistant produced alongside the plan
+                if text_content:
+                    await self._emit(on_event, "token", {"content": text_content})
+
+                mid = _ulid()
+                await self._persist_assistant_message(text_content, response, message_id=mid)
+                await self._persist_tool_message(submit_plan_tc, "Plan submitted. Waiting for user approval.", response)
+
+                # Emit assistant_message so the frontend commits the
+                # intermediate message before we emit plan_review.
+                await self._emit(on_event, "assistant_message", {
+                    "message": {
+                        "id": mid,
+                        "session_id": self.session_id,
+                        "role": "assistant",
+                        "content": text_content,
+                        "model": self.model,
+                        "input_tokens": response.input_tokens,
+                        "output_tokens": response.output_tokens,
+                        "cost_usd": response.cost_usd,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                })
+
+                # Emit the plan_review event and pause
+                await self._emit(on_event, "plan_review", {"plan": plan_text})
+                await self.save_state()
+                return text_content or f"Here's my plan:\n\n{plan_text}"
 
             # Stream partial text if present
             if text_content:
@@ -291,7 +360,7 @@ class AgentOrchestrator:
                     "arguments": tc.arguments,
                 })
 
-                result = await execute_tool(tc.name, self.workspace_path, tc.arguments, github_token=self.github_access_token)
+                result = await execute_tool(tc.name, self.workspace_path, tc.arguments, github_token=self.github_access_token, session_id=self.session_id)
 
                 self._context.add_tool_result(tc.id, result)
 
@@ -324,23 +393,45 @@ class AgentOrchestrator:
             # Save state after each iteration for crash recovery
             await self.save_state()
 
-            # Compact old tool results to save context space
-            self._context.compact_tool_results(self.workspace_path)
-
             await self._emit(on_event, "status", {
                 "message": f"Iteration {iteration}/{_MAX_ITERATIONS} — continuing...",
             })
 
-        # Max iterations reached
-        final_text = (
-            "I've reached the maximum number of tool-use iterations. "
-            "Here's what I've done so far — please let me know if you'd "
-            "like me to continue."
-        )
+        # Max iterations reached — summarize progress with Haiku, then
+        # emit iteration_limit so the consumer can set the session to
+        # INACTIVE (allowing the user to resume).
+        final_text = await self._summarize_progress()
         self._context.add_assistant_message(final_text)
-        await self._emit(on_event, "done", {"content": final_text})
+        await self._emit(on_event, "iteration_limit", {"content": final_text})
         await self.save_state()
         return final_text
+
+    # -- phase helpers ---------------------------------------------------------
+
+    def _handle_plan_review_input(self, user_message: str) -> str:
+        """Process user input during the PLAN_REVIEW phase.
+
+        The only approval signal is the literal ``[PLAN_APPROVED]`` token,
+        which is sent deterministically by:
+        - Chat GUI: the PlanReviewCard "Approve" button
+        - GitHub issues: the Haiku classifier after it decides the user approved
+
+        Any other message is treated as a change request.
+
+        Returns the (possibly augmented) user message to add to context.
+        """
+        if user_message.strip() == "[PLAN_APPROVED]":
+            self._phase = AgentPhase.EXECUTE
+            return (
+                f"[PLAN APPROVED] Proceed with the following plan:\n\n"
+                f"{self._pending_plan}\n\n"
+                f"Execute the plan now. Do not ask any more questions."
+            )
+        else:
+            # User wants changes — go back to CLARIFY
+            self._phase = AgentPhase.CLARIFY
+            self._pending_plan = None
+            return user_message
 
     # -- state persistence --------------------------------------------------
 
@@ -360,6 +451,14 @@ class AgentOrchestrator:
                 # Restore turn counter and iteration from persisted state
                 self._turn_counter = int(item.get("turn_counter", 0))
                 self._context._current_iteration = int(item.get("current_iteration", 0))
+                # Restore phase workflow state
+                phase_str = item.get("phase")
+                if phase_str:
+                    try:
+                        self._phase = AgentPhase(phase_str)
+                    except ValueError:
+                        self._phase = AgentPhase.CLARIFY
+                self._pending_plan = item.get("pending_plan")
                 logger.info(
                     "Loaded %d messages for session %s",
                     self._context.message_count,
@@ -383,6 +482,8 @@ class AgentOrchestrator:
                     "estimated_tokens": self._context.estimated_tokens,
                     "turn_counter": self._turn_counter,
                     "current_iteration": self._context._current_iteration,
+                    "phase": self._phase.value,
+                    "pending_plan": self._pending_plan,
                 },
             )
         except Exception:
@@ -390,22 +491,103 @@ class AgentOrchestrator:
 
     # -- internals ----------------------------------------------------------
 
+    async def _summarize_progress(self) -> str:
+        """Use Haiku to generate a concise summary of what the agent has done.
+
+        Called when the agent hits the iteration limit so the user knows
+        what was accomplished and what remains.
+        """
+        # Build a compact summary of tool calls from the conversation
+        tool_actions: list[str] = []
+        for msg in self._context._messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    args = block.get("input", {})
+                    if name in ("read_file", "write_file", "edit_file"):
+                        tool_actions.append(f"{name}: {args.get('path', '?')}")
+                    elif name == "run_command":
+                        cmd = str(args.get("command", ""))[:80]
+                        tool_actions.append(f"run_command: {cmd}")
+                    elif name in ("clone_repo", "create_branch", "commit_and_push", "create_pull_request"):
+                        tool_actions.append(f"{name}: {args}")
+                    elif name == "submit_plan":
+                        tool_actions.append("submit_plan")
+
+        actions_text = "\n".join(f"- {a}" for a in tool_actions[-30:])  # last 30
+
+        try:
+            summary_response = await self._llm.chat_fast(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "You are summarizing an AI agent's progress on a task. "
+                            "The agent hit its iteration limit. Here are the tool "
+                            "actions it took:\n\n"
+                            f"{actions_text}\n\n"
+                            "Write a concise summary (3-5 bullet points) of:\n"
+                            "1. What was completed\n"
+                            "2. What remains to be done\n"
+                            "End with: 'Reply if you'd like me to continue.'"
+                        ),
+                    },
+                ],
+                system_prompt="You are a concise technical summarizer.",
+                max_tokens=512,
+            )
+            # Track the cost of this Haiku call
+            try:
+                await cost_tracker.record_llm_cost(
+                    session_id=self.session_id,
+                    model="claude-haiku-4-5-20251001",
+                    input_tokens=summary_response.input_tokens,
+                    output_tokens=summary_response.output_tokens,
+                    turn_id=self._current_turn_id,
+                    cache_read_tokens=getattr(summary_response, 'cache_read_input_tokens', 0),
+                    cache_creation_tokens=getattr(summary_response, 'cache_creation_input_tokens', 0),
+                )
+            except Exception:
+                logger.warning("Failed to record summary cost", exc_info=True)
+            return summary_response.content
+        except Exception:
+            logger.warning("Failed to generate progress summary", exc_info=True)
+            return (
+                "I've reached the maximum number of iterations for this turn. "
+                "Here's what I've done so far — reply if you'd like me to continue."
+            )
+
     async def _call_llm(self):
         """Call the LLM with the current context and tools.
 
-        If repo permissions have been resolved, the tool set is scoped to
-        the user's access level and a permission notice is appended to
-        the system prompt.  Otherwise the full tool set is used.
+        Tools are filtered by both the current **phase** (clarify / execute)
+        and the user's repo **permissions** (read / write / admin).  A
+        permission notice is appended to the system prompt when available.
 
         Returns an ``LLMResponse`` (from the Anthropic or OpenAI client).
         """
+        # Determine permission-scoped tools (or None if not resolved)
+        permission_tools: list[dict[str, Any]] | None = None
+        system_prompt = self._system_prompt
+
         if self._permissions is not None:
-            tools = get_tools_for_permission_level(self._permissions.level)
+            permission_tools = get_tools_for_permission_level(self._permissions.level)
             snippet = PERMISSION_PROMPT_SNIPPETS.get(self._permissions.level, "")
-            system_prompt = f"{self._system_prompt}\n\n{snippet}" if snippet else self._system_prompt
-        else:
-            tools = TOOL_DEFINITIONS
-            system_prompt = self._system_prompt
+            if snippet:
+                system_prompt = f"{system_prompt}\n\n{snippet}"
+
+        # Intersect with phase-gated tools
+        tools = get_tools_for_phase_and_permission(self._phase, permission_tools)
+        logger.info(
+            "Tools for phase=%s: %s",
+            self._phase.value,
+            [t["name"] for t in tools],
+        )
 
         # Inject user context (GitHub username + accessible repos)
         user_context_parts: list[str] = []

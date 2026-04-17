@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -14,6 +15,8 @@ from app.agent.orchestrator import AgentOrchestrator
 from app.config import settings
 from app.db.dynamo import get_item
 from app.db.models import TABLE_SESSIONS
+
+_HEARTBEAT_INTERVAL = 25  # seconds — keeps CloudFront from dropping idle connections (60s timeout)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -175,6 +178,16 @@ def _make_event_callback(ws: WebSocket):
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
 
+async def _heartbeat(ws: WebSocket) -> None:
+    """Send periodic pings to keep the WebSocket alive through CloudFront."""
+    try:
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            await ws.send_json({"type": "heartbeat", "timestamp": datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        pass  # Connection closed — heartbeat exits silently
+
+
 @router.websocket("/ws/sessions/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """Bidirectional WebSocket for a chat session.
@@ -189,6 +202,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     _active_connections[session_id] = websocket
     logger.info("WebSocket connected: session=%s", session_id)
+
+    # Start heartbeat to keep connection alive through CloudFront (60s idle timeout)
+    heartbeat_task = asyncio.create_task(_heartbeat(websocket))
 
     try:
         while True:
@@ -229,5 +245,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     except Exception:
         logger.exception("Unexpected WebSocket error: session=%s", session_id)
     finally:
+        heartbeat_task.cancel()
         _active_connections.pop(session_id, None)
         _active_orchestrators.pop(session_id, None)

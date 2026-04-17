@@ -165,19 +165,45 @@ class ConversationContext:
                     return block.get("name", "unknown_tool")
         return "unknown_tool"
 
+    def _find_cache_safe_boundary(self) -> int:
+        """Return the index of the 2nd-to-last user message.
+
+        Messages at or before this index are in the cached prefix and
+        must NOT be mutated — doing so would invalidate prompt caching.
+        Messages after this index are in the "fresh" zone and can be
+        safely compacted.
+
+        Returns -1 if there are fewer than 2 user messages (no cached
+        prefix to protect).
+        """
+        user_indices = [
+            i for i, m in enumerate(self._messages) if m.get("role") == "user"
+        ]
+        if len(user_indices) < 2:
+            return -1
+        return user_indices[-2]
+
     def compact_tool_results(self, workspace_path: str) -> None:
         """Compact tool-result blocks based on iteration age.
 
+        Only compacts messages AFTER the cache breakpoint (2nd-to-last
+        user message) to avoid invalidating prompt caching. Messages in
+        the cached prefix are left untouched.
+
+        Rules for compactable messages:
         - Current iteration: untouched.
         - 1-2 iterations ago, over threshold: truncated with preview, full
           content saved to disk.
         - 3+ iterations ago (any size): replaced with a short summary line.
-
-        The first user message is never compacted.
         """
+        cache_boundary = self._find_cache_safe_boundary()
         results_dir = os.path.join(workspace_path, ".vswe", "tool-results")
 
         for idx, msg in enumerate(self._messages):
+            # Never compact messages in the cached prefix
+            if idx <= cache_boundary:
+                continue
+
             # Never compact the first user message
             if idx == 0 and msg.get("role") == "user":
                 continue

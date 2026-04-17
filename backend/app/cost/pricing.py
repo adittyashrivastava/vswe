@@ -9,7 +9,7 @@ from __future__ import annotations
 LLM_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-20250514": {"input_per_1k": 0.015, "output_per_1k": 0.075},
     "claude-sonnet-4-20250514": {"input_per_1k": 0.003, "output_per_1k": 0.015},
-    "claude-haiku-3-20250307": {"input_per_1k": 0.00025, "output_per_1k": 0.00125},
+    "claude-haiku-4-5-20251001": {"input_per_1k": 0.001, "output_per_1k": 0.005},
     "gpt-4": {"input_per_1k": 0.03, "output_per_1k": 0.06},
     "gpt-4-turbo": {"input_per_1k": 0.01, "output_per_1k": 0.03},
     "gpt-4o": {"input_per_1k": 0.005, "output_per_1k": 0.015},
@@ -70,15 +70,12 @@ def calculate_fargate_cost(
 
 
 def calculate_batch_cost(spot_price_per_hour: float, hours: float) -> float:
-    """Return the USD cost for an AWS Batch (EC2 Spot) job.
-
-    The caller is responsible for providing the effective spot price,
-    which varies by instance type and availability zone.
+    """Return the USD cost for an ECS Fargate compute job.
 
     Parameters
     ----------
     spot_price_per_hour : float
-        Effective spot price in USD/hour for the instance.
+        Fargate hourly rate (based on vCPU + memory).
     hours : float
         Wall-clock duration of the job in hours.
     """

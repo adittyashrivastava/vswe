@@ -55,7 +55,7 @@ class StorageStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
-            point_in_time_recovery=True,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(point_in_time_recovery_enabled=True),
         )
         self.sessions_table.add_global_secondary_index(
             index_name="user_id-created_at-index",
@@ -91,7 +91,7 @@ class StorageStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
-            point_in_time_recovery=True,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(point_in_time_recovery_enabled=True),
         )
 
         # 3. vswe-config
@@ -122,7 +122,7 @@ class StorageStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
-            point_in_time_recovery=True,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(point_in_time_recovery_enabled=True),
         )
         self.jobs_table.add_global_secondary_index(
             index_name="session_id-started_at-index",
@@ -163,7 +163,7 @@ class StorageStack(Stack):
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.RETAIN,
-            point_in_time_recovery=True,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(point_in_time_recovery_enabled=True),
         )
         self.costs_table.add_global_secondary_index(
             index_name="category-date-index",
@@ -186,6 +186,21 @@ class StorageStack(Stack):
             projection_type=dynamodb.ProjectionType.ALL,
         )
 
+        # 7. vswe-users
+        self.users_table = dynamodb.Table(
+            self,
+            "UsersTable",
+            table_name="vswe-users",
+            partition_key=dynamodb.Attribute(
+                name="user_id", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="SK", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
         self.all_tables = [
             self.sessions_table,
             self.messages_table,
@@ -193,6 +208,7 @@ class StorageStack(Stack):
             self.jobs_table,
             self.checkpoints_table,
             self.costs_table,
+            self.users_table,
         ]
 
         # =====================================================================

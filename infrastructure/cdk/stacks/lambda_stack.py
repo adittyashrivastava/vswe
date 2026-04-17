@@ -71,7 +71,7 @@ class LambdaStack(Stack):
             function_name="vswe-webhook-handler",
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=lambda_.Code.from_asset("../backend/lambda/webhook"),
+            code=lambda_.Code.from_asset("../../backend/lambda/webhook"),
             timeout=Duration.seconds(30),
             memory_size=256,
             architecture=lambda_.Architecture.ARM_64,
@@ -79,7 +79,11 @@ class LambdaStack(Stack):
                 "SQS_QUEUE_URL": self.queue.queue_url,
                 "AWS_REGION_NAME": self.region,
             },
-            log_retention=logs.RetentionDays.ONE_MONTH,
+            log_group=logs.LogGroup(
+                self, "WebhookHandlerLogs",
+                log_group_name="/vswe/lambda/webhook-handler",
+                retention=logs.RetentionDays.ONE_MONTH,
+            ),
             tracing=lambda_.Tracing.ACTIVE,
         )
 

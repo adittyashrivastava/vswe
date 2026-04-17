@@ -562,7 +562,9 @@ async def _execute_commit_and_push(workspace_path: str, params: dict[str, Any], 
     import shlex
 
     github_token = kwargs.get("github_token")
-    message = params["message"]
+    message = params.get("message")
+    if not message:
+        return "[ERROR] Missing required parameter: 'message' (commit message)."
     files = params.get("files")
 
     # Step 1: Stage files
@@ -673,10 +675,14 @@ async def _execute_create_pull_request(workspace_path: str, params: dict[str, An
     if not repo_full_name:
         return f"[ERROR] Could not determine repo from remote URL: {remote_url}"
 
-    title = params["title"]
-    body = params["body"]
-    head = params["head_branch"]
-    base = params["base_branch"]
+    title = params.get("title")
+    body = params.get("body")
+    head = params.get("head_branch")
+    base = params.get("base_branch")
+
+    missing = [p for p, v in [("title", title), ("body", body), ("head_branch", head), ("base_branch", base)] if not v]
+    if missing:
+        return f"[ERROR] Missing required parameter(s): {', '.join(missing)}"
 
     # Create PR via GitHub API
     import httpx
@@ -767,6 +773,232 @@ async def _find_git_root(workspace_path: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 11. submit_plan  (meta-tool — handled by the orchestrator, not executed)
+# ---------------------------------------------------------------------------
+
+SUBMIT_PLAN_DEFINITION: dict[str, Any] = {
+    "name": "submit_plan",
+    "description": (
+        "Submit your proposed plan of action for the user to review and "
+        "approve before you begin implementation. Call this once you have "
+        "explored the codebase and gathered enough context. The plan should "
+        "be a concise, numbered list of steps you will take."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "plan": {
+                "type": "string",
+                "description": (
+                    "A concise, numbered list of steps you will take to "
+                    "complete the user's request."
+                ),
+            },
+        },
+        "required": ["plan"],
+    },
+}
+
+
+async def _execute_submit_plan(workspace_path: str, params: dict[str, Any], **kwargs: Any) -> str:
+    """No-op executor — the orchestrator intercepts submit_plan before this runs."""
+    return "Plan submitted for user review."
+
+
+# ---------------------------------------------------------------------------
+# 12. submit_training_job
+# ---------------------------------------------------------------------------
+
+SUBMIT_TRAINING_JOB_DEFINITION: dict[str, Any] = {
+    "name": "submit_training_job",
+    "description": (
+        "Profile a Python script and submit it as an ECS Fargate task. "
+        "The profiler analyses the script (framework, memory needs, "
+        "dependencies) and selects the right Fargate size. The container "
+        "auto-installs dependencies before running the script. "
+        "Returns the job ID and profile summary. Use get_job_status to "
+        "check progress afterwards."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "script_path": {
+                "type": "string",
+                "description": (
+                    "Relative path to the training script within the workspace "
+                    "(e.g. 'my-repo/train.py')."
+                ),
+            },
+        },
+        "required": ["script_path"],
+    },
+}
+
+
+async def _execute_submit_training_job(
+    workspace_path: str, params: dict[str, Any], **kwargs: Any,
+) -> str:
+    import uuid
+    from dataclasses import asdict
+
+    try:
+        from app.jobs.profiler import profile_job
+        from app.jobs.scheduler import JobScheduler
+        from app.db import dynamo
+        from app.db.models import (
+            JobItem,
+            JobStatus,
+            JobProfile as JobProfileModel,
+            TABLE_JOBS,
+        )
+    except ImportError as exc:
+        return f"[ERROR] Job modules not available: {exc}"
+
+    script_path = params["script_path"]
+    abs_script = _resolve(workspace_path, script_path)
+    if not os.path.isfile(abs_script):
+        return f"[ERROR] Training script not found: {script_path}"
+
+    # -- Step 1: Profile the script --
+    try:
+        profile = await profile_job(abs_script, workspace_path)
+    except Exception as exc:
+        return f"[ERROR] Profiling failed: {exc}"
+
+    # -- Step 2: Create the job record in DynamoDB --
+    job_id = f"job-{uuid.uuid4().hex[:12]}"
+    session_id = kwargs.get("session_id", "unknown")
+    try:
+        rec = profile.recommended_instance
+        job_item = JobItem(
+            job_id=job_id,
+            session_id=session_id,
+            status=JobStatus.PROFILING,
+            instance_type=f"{rec.vcpus}cpu-{rec.memory_gb}gb",
+            spot_price=profile.estimated_spot_price,
+            script_path=script_path,
+            profile=JobProfileModel(
+                framework=profile.framework,
+                model_params=profile.model_param_count,
+                estimated_gpu_mem_gb=profile.estimated_gpu_memory_gb,
+                estimated_runtime_hours=profile.estimated_runtime_hours or 0.0,
+            ),
+        )
+        await dynamo.put_item(TABLE_JOBS, job_item.to_dynamo_item())
+    except Exception as exc:
+        logger.warning("Failed to persist job record: %s", exc)
+
+    # -- Step 3: Submit as ECS Fargate task --
+    try:
+        scheduler = JobScheduler()
+        task_arn = await scheduler.submit_job(
+            job_id=job_id,
+            profile=profile,
+            script_path=abs_script,
+            workspace_path=workspace_path,
+        )
+    except Exception as exc:
+        return (
+            f"[ERROR] Profiling succeeded but ECS task submission failed: {exc}\n\n"
+            f"Profile summary:\n{_format_profile(profile)}\n\n"
+            f"This usually means the ECS cluster or job task definition is not deployed. "
+            f"Run `cdk deploy VsweEcs` to create the required resources."
+        )
+
+    # -- Step 4: Update job record with task ARN --
+    try:
+        from app.db import dynamo as _dyn
+        await _dyn.update_item(
+            TABLE_JOBS,
+            key={"job_id": job_id, "SK": "META"},
+            update_expression="SET batch_job_id = :b, #st = :s",
+            expression_attribute_names={"#st": "status"},
+            expression_attribute_values={
+                ":b": task_arn,
+                ":s": JobStatus.QUEUED.value,
+            },
+        )
+    except Exception:
+        logger.warning("Failed to update job record with task_arn", exc_info=True)
+
+    return (
+        f"Job submitted successfully.\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Task ARN:** {task_arn}\n\n"
+        f"{_format_profile(profile)}\n\n"
+        f"Use `get_job_status` with task_arn `{task_arn}` to check progress."
+    )
+
+
+def _format_profile(profile: Any) -> str:
+    """Format a JobProfile into a human-readable summary."""
+    rec = profile.recommended_instance
+    return (
+        f"**Profile:**\n"
+        f"- Framework: {profile.framework}\n"
+        f"- Parameters: {profile.model_param_count:,}\n"
+        f"- Precision: {profile.precision}\n"
+        f"- Batch size: {profile.batch_size}, Epochs: {profile.epochs}\n"
+        f"- Fargate size: {rec.vcpus} vCPU, {rec.memory_gb} GB RAM\n"
+        f"- Est. cost: ${profile.estimated_total_cost:.4f}/hr"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 13. get_job_status
+# ---------------------------------------------------------------------------
+
+GET_JOB_STATUS_DEFINITION: dict[str, Any] = {
+    "name": "get_job_status",
+    "description": (
+        "Check the current status of an ECS Fargate job task. "
+        "Returns the task status, runtime, and exit code."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_arn": {
+                "type": "string",
+                "description": "The ECS task ARN returned by submit_training_job.",
+            },
+        },
+        "required": ["task_arn"],
+    },
+}
+
+
+async def _execute_get_job_status(
+    workspace_path: str, params: dict[str, Any], **kwargs: Any,
+) -> str:
+    try:
+        from app.jobs.scheduler import JobScheduler
+    except ImportError as exc:
+        return f"[ERROR] Job modules not available: {exc}"
+
+    task_arn = params["task_arn"]
+
+    try:
+        scheduler = JobScheduler()
+        status = await scheduler.get_job_status(task_arn)
+    except Exception as exc:
+        return f"[ERROR] Failed to get job status: {exc}"
+
+    lines = [
+        f"**Status:** {status['status']}",
+    ]
+    if status.get("status_reason"):
+        lines.append(f"**Reason:** {status['status_reason']}")
+    if status.get("started_at"):
+        lines.append(f"**Started:** {status['started_at']}")
+    if status.get("stopped_at"):
+        lines.append(f"**Stopped:** {status['stopped_at']}")
+    if status.get("exit_code") is not None:
+        lines.append(f"**Exit code:** {status['exit_code']}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -781,6 +1013,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     CREATE_BRANCH_DEFINITION,
     COMMIT_AND_PUSH_DEFINITION,
     CREATE_PULL_REQUEST_DEFINITION,
+    SUBMIT_TRAINING_JOB_DEFINITION,
+    GET_JOB_STATUS_DEFINITION,
 ]
 
 TOOL_EXECUTORS: dict[str, Any] = {
@@ -794,6 +1028,9 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "create_branch": _execute_create_branch,
     "commit_and_push": _execute_commit_and_push,
     "create_pull_request": _execute_create_pull_request,
+    "submit_plan": _execute_submit_plan,
+    "submit_training_job": _execute_submit_training_job,
+    "get_job_status": _execute_get_job_status,
 }
 
 
@@ -802,6 +1039,7 @@ async def execute_tool(
     workspace_path: str,
     params: dict[str, Any],
     github_token: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Execute a tool by name and return its string output.
 
@@ -813,7 +1051,11 @@ async def execute_tool(
 
     logger.info("Executing tool %s with params %s", tool_name, json.dumps(params, default=str)[:500])
     try:
-        result = await executor(workspace_path, params, github_token=github_token)
+        result = await executor(
+            workspace_path, params,
+            github_token=github_token,
+            session_id=session_id,
+        )
     except Exception as exc:
         logger.exception("Tool %s raised an exception", tool_name)
         result = f"[ERROR] Tool execution failed: {exc}"

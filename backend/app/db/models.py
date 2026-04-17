@@ -20,11 +20,8 @@ class SessionType(str, Enum):
 
 
 class SessionState(str, Enum):
-    ACTIVE = "active"
-    AWAITING_CLARIFICATION = "awaiting_clarification"
-    PR_OPENED = "pr_opened"
-    COMPLETED = "completed"
-    ERROR = "error"
+    ACTIVE = "active"      # Agent is currently running — block new comments
+    INACTIVE = "inactive"  # Agent is idle — ready to process new comments
 
 
 class MessageRole(str, Enum):

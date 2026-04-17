@@ -1,12 +1,11 @@
-"""AWS Batch job scheduler for ML training workloads.
+"""ECS Fargate job scheduler for VSWE compute tasks.
 
-Submits profiled training jobs to AWS Batch using Spot instances, manages
-job definitions, and provides status / cancellation helpers.
+Submits jobs as on-demand ECS Fargate tasks. Each job runs in a container
+that auto-installs dependencies and executes the user's script.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Any
@@ -23,20 +22,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-_JOB_QUEUE_GPU = os.getenv("VSWE_BATCH_GPU_QUEUE", "vswe-gpu-spot")
-_JOB_QUEUE_CPU = os.getenv("VSWE_BATCH_CPU_QUEUE", "vswe-cpu-spot")
-_EFS_VOLUME_ID = os.getenv("VSWE_EFS_VOLUME_ID", "")
-_EFS_MOUNT_POINT = "/mnt/efs"
-_CONTAINER_IMAGE = os.getenv("VSWE_TRAINING_IMAGE", "vswe-training:latest")
-_JOB_ROLE_ARN = os.getenv("VSWE_BATCH_JOB_ROLE_ARN", "")
-_EXECUTION_ROLE_ARN = os.getenv("VSWE_BATCH_EXECUTION_ROLE_ARN", "")
+_ECS_CLUSTER = os.getenv("VSWE_ECS_CLUSTER", "vswe-cluster")
+_JOB_TASK_DEF = os.getenv("VSWE_JOB_TASK_DEF", "vswe-job")
+_CONTAINER_NAME = "job"
+_SUBNETS = os.getenv("VSWE_PRIVATE_SUBNETS", "")  # comma-separated
+_SECURITY_GROUPS = os.getenv("VSWE_SECURITY_GROUPS", "")  # comma-separated
 
 
 class JobScheduler:
-    """Thin wrapper around the AWS Batch API tailored for VSWE training jobs."""
+    """Submits compute jobs as ECS Fargate tasks."""
 
     def __init__(self, region: str | None = None) -> None:
-        self.batch_client = boto3.client("batch", region_name=region or _AWS_REGION)
+        self.ecs_client = boto3.client("ecs", region_name=region or _AWS_REGION)
 
     # ------------------------------------------------------------------
     # Submit
@@ -49,19 +46,11 @@ class JobScheduler:
         script_path: str,
         workspace_path: str,
     ) -> str:
-        """Submit a training job to AWS Batch and return the Batch job ID.
+        """Submit a job as an ECS Fargate task and return the task ARN.
 
-        The method:
-        1. Registers (or re-uses) a job definition matching the instance type.
-        2. Selects the appropriate queue (GPU-spot or CPU-spot).
-        3. Passes environment variables so the training container can locate
-           the script, workspace, and configure the checkpoint manager.
+        The task runs the vswe_checkpoint.runner entrypoint which reads
+        env vars, auto-installs dependencies, and executes the script.
         """
-        job_def_name = self._job_definition_name(profile)
-        job_def_arn = self._ensure_job_definition(job_def_name, profile)
-
-        queue = _JOB_QUEUE_GPU if profile.needs_gpu else _JOB_QUEUE_CPU
-
         environment = self._build_environment(
             job_id=job_id,
             profile=profile,
@@ -69,235 +58,168 @@ class JobScheduler:
             workspace_path=workspace_path,
         )
 
-        resource_requirements = self._build_resource_requirements(profile)
+        # Fargate CPU/memory override from profile
+        fargate_size = profile.recommended_instance
+
+        overrides: dict[str, Any] = {
+            "containerOverrides": [
+                {
+                    "name": _CONTAINER_NAME,
+                    "environment": environment,
+                },
+            ],
+            "cpu": str(fargate_size.vcpus),
+            "memory": str(int(fargate_size.memory_gb * 1024)),
+        }
+
+        # Network configuration
+        network_config: dict[str, Any] = {
+            "awsvpcConfiguration": {
+                "assignPublicIp": "DISABLED",
+            }
+        }
+        if _SUBNETS:
+            network_config["awsvpcConfiguration"]["subnets"] = [
+                s.strip() for s in _SUBNETS.split(",") if s.strip()
+            ]
+        if _SECURITY_GROUPS:
+            network_config["awsvpcConfiguration"]["securityGroups"] = [
+                s.strip() for s in _SECURITY_GROUPS.split(",") if s.strip()
+            ]
 
         try:
-            response = self.batch_client.submit_job(
-                jobName=f"vswe-{job_id}",
-                jobQueue=queue,
-                jobDefinition=job_def_arn,
-                containerOverrides={
-                    "environment": environment,
-                    "resourceRequirements": resource_requirements,
-                },
-                retryStrategy={
-                    # Spot interruptions trigger a retry (SPOT_CAPACITY).
-                    "attempts": 3,
-                    "evaluateOnExit": [
-                        {
-                            "onStatusReason": "Host EC2*",
-                            "action": "RETRY",
-                        },
-                        {
-                            "onReason": "SPOT_CAPACITY",
-                            "action": "RETRY",
-                        },
-                        {
-                            "onExitCode": "0",
-                            "action": "EXIT",
-                        },
-                    ],
-                },
-                timeout={
-                    # Hard cap: 24 hours.  Individual jobs should finish faster;
-                    # this prevents runaway costs from buggy scripts.
-                    "attemptDurationSeconds": 86400,
-                },
-                tags={
-                    "vswe:job_id": job_id,
-                    "vswe:instance_type": profile.recommended_instance.instance_type,
-                    "vswe:framework": profile.framework,
-                },
+            response = self.ecs_client.run_task(
+                cluster=_ECS_CLUSTER,
+                taskDefinition=_JOB_TASK_DEF,
+                launchType="FARGATE",
+                overrides=overrides,
+                networkConfiguration=network_config,
+                count=1,
+                startedBy=f"vswe-{job_id}",
+                tags=[
+                    {"key": "vswe:job_id", "value": job_id},
+                    {"key": "vswe:framework", "value": profile.framework},
+                ],
             )
-            batch_job_id: str = response["jobId"]
+
+            tasks = response.get("tasks", [])
+            if not tasks:
+                failures = response.get("failures", [])
+                reason = failures[0].get("reason", "Unknown") if failures else "No task started"
+                raise RuntimeError(f"ECS RunTask returned no tasks: {reason}")
+
+            task_arn: str = tasks[0]["taskArn"]
             logger.info(
-                "Submitted Batch job %s (queue=%s, definition=%s)",
-                batch_job_id,
-                queue,
-                job_def_arn,
+                "Started ECS task %s (cluster=%s, taskDef=%s)",
+                task_arn, _ECS_CLUSTER, _JOB_TASK_DEF,
             )
-            return batch_job_id
+            return task_arn
 
         except ClientError as exc:
-            logger.error("Failed to submit Batch job for %s: %s", job_id, exc)
+            logger.error("Failed to start ECS task for %s: %s", job_id, exc)
             raise
 
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
-    async def get_job_status(self, batch_job_id: str) -> dict[str, Any]:
-        """Return current status of a Batch job.
+    async def get_job_status(self, task_arn: str) -> dict[str, Any]:
+        """Return current status of an ECS task.
 
-        The returned dict contains at minimum:
-        - ``status``: one of SUBMITTED | PENDING | RUNNABLE | STARTING |
-          RUNNING | SUCCEEDED | FAILED
-        - ``status_reason``: human-readable reason (if available)
-        - ``started_at``: epoch ms (if started)
-        - ``stopped_at``: epoch ms (if finished)
-        - ``log_stream_name``: CloudWatch log stream (if available)
+        Returns dict with keys:
+        - status: PROVISIONING | PENDING | ACTIVATING | RUNNING |
+                  DEACTIVATING | STOPPING | DEPROVISIONING | STOPPED
+        - status_reason: human-readable reason (if available)
+        - started_at: ISO timestamp (if started)
+        - stopped_at: ISO timestamp (if finished)
+        - exit_code: container exit code (if finished)
+        - log_stream_name: CloudWatch log stream
         """
         try:
-            response = self.batch_client.describe_jobs(jobs=[batch_job_id])
+            response = self.ecs_client.describe_tasks(
+                cluster=_ECS_CLUSTER,
+                tasks=[task_arn],
+            )
         except ClientError as exc:
-            logger.error("describe_jobs failed for %s: %s", batch_job_id, exc)
+            logger.error("describe_tasks failed for %s: %s", task_arn, exc)
             raise
 
-        jobs = response.get("jobs", [])
-        if not jobs:
-            return {"status": "UNKNOWN", "status_reason": "Job not found"}
+        tasks = response.get("tasks", [])
+        if not tasks:
+            return {"status": "UNKNOWN", "status_reason": "Task not found"}
 
-        job = jobs[0]
-        container = job.get("container", {})
+        task = tasks[0]
+        container = {}
+        for c in task.get("containers", []):
+            if c.get("name") == _CONTAINER_NAME:
+                container = c
+                break
+
+        started_at = task.get("startedAt")
+        stopped_at = task.get("stoppedAt")
 
         return {
-            "status": job.get("status", "UNKNOWN"),
-            "status_reason": job.get("statusReason", ""),
-            "started_at": job.get("startedAt"),
-            "stopped_at": job.get("stoppedAt"),
-            "log_stream_name": container.get("logStreamName"),
+            "status": task.get("lastStatus", "UNKNOWN"),
+            "status_reason": task.get("stoppedReason", ""),
+            "started_at": started_at.isoformat() if started_at else None,
+            "stopped_at": stopped_at.isoformat() if stopped_at else None,
             "exit_code": container.get("exitCode"),
-            "attempts": len(job.get("attempts", [])),
+            "log_stream_name": None,  # Available via CloudWatch log group
         }
 
     # ------------------------------------------------------------------
     # Cancel
     # ------------------------------------------------------------------
 
-    async def cancel_job(self, batch_job_id: str, reason: str = "User requested") -> None:
-        """Cancel a Batch job that is in SUBMITTED, PENDING, or RUNNABLE state,
-        or terminate it if already RUNNING.
-        """
+    async def cancel_job(self, task_arn: str, reason: str = "User requested") -> None:
+        """Stop a running ECS task."""
         try:
-            # cancel_job works for jobs not yet RUNNING.
-            self.batch_client.cancel_job(jobId=batch_job_id, reason=reason)
-            logger.info("Cancelled Batch job %s: %s", batch_job_id, reason)
-        except ClientError:
-            # If the job is already RUNNING, we need terminate_job instead.
-            try:
-                self.batch_client.terminate_job(jobId=batch_job_id, reason=reason)
-                logger.info("Terminated Batch job %s: %s", batch_job_id, reason)
-            except ClientError as exc:
-                logger.error("Failed to cancel/terminate %s: %s", batch_job_id, exc)
-                raise
+            self.ecs_client.stop_task(
+                cluster=_ECS_CLUSTER,
+                task=task_arn,
+                reason=reason,
+            )
+            logger.info("Stopped ECS task %s: %s", task_arn, reason)
+        except ClientError as exc:
+            logger.error("Failed to stop task %s: %s", task_arn, exc)
+            raise
 
     # ------------------------------------------------------------------
-    # List active jobs
+    # List active
     # ------------------------------------------------------------------
 
     async def list_active_jobs(self) -> list[dict[str, Any]]:
-        """List all active (non-terminal) VSWE jobs across both queues."""
+        """List all running VSWE job tasks."""
         active: list[dict[str, Any]] = []
-
-        for queue in (_JOB_QUEUE_GPU, _JOB_QUEUE_CPU):
-            for status in ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"):
-                try:
-                    response = self.batch_client.list_jobs(
-                        jobQueue=queue,
-                        jobStatus=status,
-                        maxResults=100,
-                    )
-                    for summary in response.get("jobSummaryList", []):
-                        active.append({
-                            "batch_job_id": summary["jobId"],
-                            "job_name": summary.get("jobName", ""),
-                            "status": summary.get("status", ""),
-                            "started_at": summary.get("startedAt"),
-                            "queue": queue,
-                        })
-                except ClientError as exc:
-                    logger.warning("list_jobs failed for queue=%s status=%s: %s", queue, status, exc)
+        try:
+            response = self.ecs_client.list_tasks(
+                cluster=_ECS_CLUSTER,
+                family=_JOB_TASK_DEF,
+                desiredStatus="RUNNING",
+                maxResults=100,
+            )
+            task_arns = response.get("taskArns", [])
+            if task_arns:
+                desc = self.ecs_client.describe_tasks(
+                    cluster=_ECS_CLUSTER,
+                    tasks=task_arns,
+                )
+                for task in desc.get("tasks", []):
+                    started_at = task.get("startedAt")
+                    active.append({
+                        "task_arn": task["taskArn"],
+                        "status": task.get("lastStatus", ""),
+                        "started_at": started_at.isoformat() if started_at else None,
+                        "started_by": task.get("startedBy", ""),
+                    })
+        except ClientError as exc:
+            logger.warning("list_tasks failed: %s", exc)
 
         return active
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _job_definition_name(profile: JobProfile) -> str:
-        """Deterministic job-definition name based on instance category + GPU model."""
-        inst = profile.recommended_instance
-        if inst.gpu_model:
-            suffix = f"{inst.gpu_model.lower()}-{inst.gpu_count}gpu"
-        else:
-            suffix = f"cpu-{inst.vcpus}vcpu"
-        return f"vswe-training-{suffix}"
-
-    def _ensure_job_definition(self, name: str, profile: JobProfile) -> str:
-        """Register a new job definition revision (or return the latest).
-
-        AWS Batch job definitions are versioned; registering the same
-        definition is cheap and idempotent in practice.
-        """
-        inst = profile.recommended_instance
-
-        volumes: list[dict[str, Any]] = []
-        mount_points: list[dict[str, Any]] = []
-
-        if _EFS_VOLUME_ID:
-            volumes.append({
-                "name": "efs",
-                "efsVolumeConfiguration": {
-                    "fileSystemId": _EFS_VOLUME_ID,
-                    "rootDirectory": "/",
-                    "transitEncryption": "ENABLED",
-                },
-            })
-            mount_points.append({
-                "sourceVolume": "efs",
-                "containerPath": _EFS_MOUNT_POINT,
-                "readOnly": False,
-            })
-
-        resource_requirements = self._build_resource_requirements(profile)
-
-        container_properties: dict[str, Any] = {
-            "image": _CONTAINER_IMAGE,
-            "resourceRequirements": resource_requirements,
-            "mountPoints": mount_points,
-            "volumes": volumes,
-            "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {
-                    "awslogs-group": "/vswe/training",
-                    "awslogs-stream-prefix": name,
-                },
-            },
-            "command": ["python", "-m", "vswe_checkpoint.runner"],
-        }
-
-        if _JOB_ROLE_ARN:
-            container_properties["jobRoleArn"] = _JOB_ROLE_ARN
-        if _EXECUTION_ROLE_ARN:
-            container_properties["executionRoleArn"] = _EXECUTION_ROLE_ARN
-
-        try:
-            resp = self.batch_client.register_job_definition(
-                jobDefinitionName=name,
-                type="container",
-                containerProperties=container_properties,
-                platformCapabilities=["EC2"],
-                retryStrategy={"attempts": 3},
-            )
-            arn: str = resp["jobDefinitionArn"]
-            logger.info("Registered job definition %s -> %s", name, arn)
-            return arn
-        except ClientError as exc:
-            logger.error("register_job_definition failed for %s: %s", name, exc)
-            raise
-
-    @staticmethod
-    def _build_resource_requirements(profile: JobProfile) -> list[dict[str, str]]:
-        """Build the ``resourceRequirements`` list for Batch."""
-        inst = profile.recommended_instance
-        reqs: list[dict[str, str]] = [
-            {"type": "VCPU", "value": str(inst.vcpus)},
-            {"type": "MEMORY", "value": str(int(inst.memory_gb * 1024))},  # MiB
-        ]
-        if inst.gpu_count > 0:
-            reqs.append({"type": "GPU", "value": str(inst.gpu_count)})
-        return reqs
 
     @staticmethod
     def _build_environment(
@@ -317,7 +239,7 @@ class JobScheduler:
             {"name": "VSWE_BATCH_SIZE", "value": str(profile.batch_size)},
             {"name": "VSWE_EPOCHS", "value": str(profile.epochs)},
             {"name": "VSWE_CHECKPOINT_INTERVAL", "value": str(profile.checkpoint_interval_epochs)},
-            {"name": "VSWE_EFS_MOUNT", "value": _EFS_MOUNT_POINT},
-            {"name": "VSWE_CHECKPOINT_DIR", "value": f"{_EFS_MOUNT_POINT}/checkpoints/{job_id}"},
-            {"name": "VSWE_INSTANCE_TYPE", "value": profile.recommended_instance.instance_type},
+            {"name": "VSWE_EFS_MOUNT", "value": "/efs"},
+            {"name": "VSWE_CHECKPOINT_DIR", "value": f"/efs/checkpoints/{job_id}"},
+            {"name": "VSWE_INSTANCE_TYPE", "value": f"fargate-{profile.recommended_instance.vcpus}vcpu"},
         ]

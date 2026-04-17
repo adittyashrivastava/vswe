@@ -94,7 +94,7 @@ class SessionDetailedCost(BaseModel):
 MODEL_COLORS = {
     "claude-opus-4-20250514": "#8B5CF6",
     "claude-sonnet-4-20250514": "#3B82F6",
-    "claude-haiku-3-20250307": "#10B981",
+    "claude-haiku-4-5-20251001": "#10B981",
     "gpt-4": "#F59E0B",
     "gpt-4-turbo": "#EC4899",
     "other": "#6B7280",

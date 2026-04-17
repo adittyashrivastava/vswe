@@ -31,6 +31,7 @@ export type WebSocketEventType =
   | "tool_result"
   | "token"
   | "assistant_message"
+  | "plan_review"
   | "done"
   | "error";
 
@@ -43,6 +44,7 @@ export interface WebSocketEvent {
     tool_call?: ToolCall;
     tool_result?: { id: string; output: string; error?: string };
     message?: Message;
+    plan?: string;
     error?: string;
   };
   timestamp: string;

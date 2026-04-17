@@ -153,6 +153,7 @@ class LLMRouter:
         self,
         messages: list[dict[str, Any]],
         system_prompt: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 1024,
     ) -> Any:
         """Use the cheapest/fastest model for simple internal tasks.
@@ -161,6 +162,7 @@ class LLMRouter:
             messages=messages,
             model="claude-haiku-4-5-20251001",
             system_prompt=system_prompt,
+            tools=tools,
             max_tokens=max_tokens,
         )
 

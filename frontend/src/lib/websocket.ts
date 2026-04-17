@@ -87,6 +87,9 @@ export class WebSocketManager {
                 }
               : undefined;
             break;
+          case "plan_review":
+            normalized.data.plan = raw.plan;
+            break;
           case "done":
             normalized.data.content = raw.content;
             normalized.data.message = {

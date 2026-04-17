@@ -1,8 +1,8 @@
-"""Deterministic ML job profiler.
+"""Deterministic job profiler.
 
-Parses a Python training script with the ``ast`` module, extracts framework
-usage, model architecture, hyperparameters, and precision settings, then
-estimates resource requirements and recommends the cheapest Spot instance.
+Parses a Python script with the ``ast`` module, extracts framework usage,
+model architecture, hyperparameters, and precision settings, then estimates
+resource requirements and selects the smallest Fargate task size that fits.
 
 This is intentionally *not* LLM-based. All analysis is deterministic so the
 output is reproducible and testable.
@@ -18,13 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .instance_catalog import (
-    InstanceSpec,
-    filter_instances,
-    get_gpu_instances,
-    get_instance,
-)
-from .spot_prices import get_on_demand_price, get_spot_prices
+from .instance_catalog import FargateSize, select_fargate_size
+from .spot_prices import get_fargate_hourly_cost
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +93,7 @@ KNOWN_ARCHITECTURES: dict[str, int] = {
 
 @dataclass
 class JobProfile:
-    """Complete resource profile for a training job."""
+    """Complete resource profile for a job."""
 
     framework: str  # "pytorch" | "tensorflow" | "jax" | "unknown"
     model_param_count: int  # estimated total parameters
@@ -110,9 +105,9 @@ class JobProfile:
     estimated_cpu_memory_gb: float
     estimated_storage_gb: float
     estimated_runtime_hours: float | None  # None when we cannot estimate
-    recommended_instance: InstanceSpec
-    estimated_spot_price: float  # USD/hr
-    estimated_total_cost: float  # spot_price * runtime (or spot_price * 1 hr)
+    recommended_instance: FargateSize
+    estimated_spot_price: float  # USD/hr (Fargate on-demand rate)
+    estimated_total_cost: float  # cost_per_hr * runtime (or cost_per_hr * 1 hr)
     checkpoint_interval_epochs: int
     analysis_details: dict[str, Any] = field(default_factory=dict)
 
@@ -156,6 +151,17 @@ async def profile_job(script_path: str, workspace_path: str) -> JobProfile:
     # 6. Epochs
     epochs = _extract_epochs(ctx)
 
+    # -- Detect non-ML scripts: no framework, no params, no GPU ----------------
+    is_simple_script = (
+        framework == "unknown" and param_count == 0 and not needs_gpu
+    )
+
+    if is_simple_script:
+        # Minimal allocation for plain Python scripts (data processing,
+        # hello-world tests, etc.)
+        batch_size = 1
+        epochs = 1
+
     # 7. Memory estimates
     gpu_mem_gb = _estimate_gpu_memory_gb(param_count, precision, batch_size) if needs_gpu else 0.0
     cpu_mem_gb = _estimate_cpu_memory_gb(param_count, precision, batch_size)
@@ -163,22 +169,20 @@ async def profile_job(script_path: str, workspace_path: str) -> JobProfile:
     # 8. Storage estimate (workspace + checkpoints + overhead)
     storage_gb = _estimate_storage_gb(param_count, precision, workspace_path)
 
-    # 9. Instance selection
-    instance, spot_price = await _select_instance(
-        needs_gpu=needs_gpu,
-        gpu_mem_gb=gpu_mem_gb,
-        cpu_mem_gb=cpu_mem_gb,
-        storage_gb=storage_gb,
-    )
+    # 9. Fargate size selection
+    # Convert memory GB to minimum requirement for Fargate sizing
+    min_mem = max(cpu_mem_gb, gpu_mem_gb) if needs_gpu else cpu_mem_gb
+    fargate_size = select_fargate_size(min_memory_gb=min_mem)
 
     # 10. Runtime estimate (very rough — we don't know dataset size)
     runtime_hours: float | None = None  # TODO: dataset-size estimation
 
     # 11. Cost
-    total_cost = spot_price * (runtime_hours if runtime_hours else 1.0)
+    hourly_cost = get_fargate_hourly_cost(fargate_size)
+    total_cost = hourly_cost * (runtime_hours if runtime_hours else 1.0)
 
-    # 12. Checkpoint interval
-    checkpoint_interval = _recommend_checkpoint_interval(param_count, precision, epochs)
+    # 12. Checkpoint interval (skip for non-ML scripts)
+    checkpoint_interval = 1 if is_simple_script else _recommend_checkpoint_interval(param_count, precision, epochs)
 
     return JobProfile(
         framework=framework,
@@ -191,8 +195,8 @@ async def profile_job(script_path: str, workspace_path: str) -> JobProfile:
         estimated_cpu_memory_gb=round(cpu_mem_gb, 2),
         estimated_storage_gb=round(storage_gb, 2),
         estimated_runtime_hours=runtime_hours,
-        recommended_instance=instance,
-        estimated_spot_price=round(spot_price, 4),
+        recommended_instance=fargate_size,
+        estimated_spot_price=round(hourly_cost, 4),
         estimated_total_cost=round(total_cost, 4),
         checkpoint_interval_epochs=checkpoint_interval,
         analysis_details={
@@ -298,14 +302,16 @@ _GPU_INDICATORS = (
 
 
 def _detect_gpu_usage(ctx: _AnalysisContext) -> bool:
-    """Heuristic: search the source for common GPU-related patterns."""
+    """Heuristic: search the source for explicit GPU-related patterns.
+
+    Only returns True if the script actively uses GPU APIs (e.g. ``.cuda()``,
+    ``tf.device("/gpu:0")``).  Merely importing a framework like PyTorch does
+    NOT imply GPU — many scripts run on CPU only.
+    """
     source_lower = ctx.source.lower()
     for indicator in _GPU_INDICATORS:
         if indicator.lower() in source_lower:
             return True
-    # If the script imports a GPU framework, assume GPU by default.
-    if _detect_framework(ctx) in ("pytorch", "tensorflow", "jax"):
-        return True
     return False
 
 
@@ -353,9 +359,10 @@ def _estimate_param_count(ctx: _AnalysisContext) -> int:
     if count > 0:
         return count
 
-    # Fallback: assume a moderate model (roughly ResNet-50 scale)
-    ctx.param_estimation_method = "default"
-    return 25_000_000
+    # Fallback: no model detected. Return 0 to signal a non-ML or
+    # unrecognised script — the caller uses this to pick a minimal instance.
+    ctx.param_estimation_method = "none"
+    return 0
 
 
 def _match_known_architecture(ctx: _AnalysisContext) -> int:
@@ -570,9 +577,11 @@ def _estimate_gpu_memory_gb(param_count: int, precision: str, batch_size: int) -
 def _estimate_cpu_memory_gb(param_count: int, precision: str, batch_size: int) -> float:
     """Estimate peak CPU/system memory.
 
-    CPU memory typically holds a copy of the data batch plus overhead for data
-    loading workers.  We budget 2x the GPU estimate as a conservative floor.
+    For ML workloads, budget 2x the GPU estimate.  For non-ML scripts
+    (param_count == 0), default to a minimal 0.5 GB.
     """
+    if param_count == 0:
+        return 0.5
     gpu_est = _estimate_gpu_memory_gb(param_count, precision, batch_size)
     return max(gpu_est * 2, 4.0)
 
@@ -610,54 +619,7 @@ def _estimate_storage_gb(param_count: int, precision: str, workspace_path: str) 
 # ---------------------------------------------------------------------------
 
 
-async def _select_instance(
-    *,
-    needs_gpu: bool,
-    gpu_mem_gb: float,
-    cpu_mem_gb: float,
-    storage_gb: float,
-) -> tuple[InstanceSpec, float]:
-    """Pick the cheapest Spot instance that satisfies the resource requirements.
-
-    Returns ``(instance_spec, spot_price_usd_per_hour)``.
-    """
-    if needs_gpu:
-        candidates = filter_instances(
-            min_gpu_memory_gb=gpu_mem_gb,
-            min_memory_gb=cpu_mem_gb,
-            category="gpu",
-        )
-    else:
-        candidates = filter_instances(
-            min_memory_gb=cpu_mem_gb,
-            category="cpu",
-        )
-        if not candidates:
-            candidates = filter_instances(min_memory_gb=cpu_mem_gb, category="memory")
-
-    if not candidates:
-        # Ultimate fallback: largest GPU instance in catalog.
-        gpu_instances = get_gpu_instances()
-        candidates = [gpu_instances[-1]] if gpu_instances else []
-        if not candidates:
-            fallback = get_instance("g5.xlarge")
-            assert fallback is not None
-            candidates = [fallback]
-
-    # Fetch spot prices for all candidates and pick cheapest.
-    type_names = [c.instance_type for c in candidates]
-    prices = await get_spot_prices(type_names)
-
-    best: InstanceSpec | None = None
-    best_price = float("inf")
-    for c in candidates:
-        p = prices.get(c.instance_type, get_on_demand_price(c.instance_type))
-        if p < best_price:
-            best_price = p
-            best = c
-
-    assert best is not None
-    return best, best_price
+    # _select_instance removed — Fargate sizing is handled by select_fargate_size()
 
 
 # ---------------------------------------------------------------------------
@@ -705,26 +667,28 @@ def _recommend_checkpoint_interval(param_count: int, precision: str, epochs: int
 
 
 async def _fallback_profile(workspace_path: str) -> JobProfile:
-    """Conservative fallback when parsing fails entirely."""
-    instance = get_instance("g5.xlarge")
-    assert instance is not None
-    price = get_on_demand_price("g5.xlarge") * 0.35  # rough spot estimate
+    """Conservative fallback when parsing fails entirely.
+
+    Defaults to the smallest Fargate size (0.25 vCPU, 0.5 GB).
+    """
+    size = select_fargate_size(min_memory_gb=0.5)
+    cost = get_fargate_hourly_cost(size)
     return JobProfile(
         framework="unknown",
-        model_param_count=25_000_000,
+        model_param_count=0,
         precision="fp32",
-        batch_size=32,
-        epochs=10,
-        needs_gpu=True,
-        estimated_gpu_memory_gb=4.0,
-        estimated_cpu_memory_gb=8.0,
-        estimated_storage_gb=20.0,
+        batch_size=1,
+        epochs=1,
+        needs_gpu=False,
+        estimated_gpu_memory_gb=0.0,
+        estimated_cpu_memory_gb=0.5,
+        estimated_storage_gb=5.0,
         estimated_runtime_hours=None,
-        recommended_instance=instance,
-        estimated_spot_price=round(price, 4),
-        estimated_total_cost=round(price, 4),
+        recommended_instance=size,
+        estimated_spot_price=round(cost, 4),
+        estimated_total_cost=round(cost, 4),
         checkpoint_interval_epochs=1,
-        analysis_details={"error": "failed to parse script, using conservative fallback"},
+        analysis_details={"error": "failed to parse script, using minimal fallback"},
     )
 
 

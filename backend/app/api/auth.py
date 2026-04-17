@@ -31,7 +31,7 @@ GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_API_BASE = "https://api.github.com"
 
 def _get_oauth_redirect_uri() -> str:
-    return f"{settings.frontend_url}/api/auth/github/callback"
+    return f"{settings.backend_url}/api/auth/github/callback"
 
 def _get_frontend_success_url() -> str:
     return f"{settings.frontend_url}/auth/success"

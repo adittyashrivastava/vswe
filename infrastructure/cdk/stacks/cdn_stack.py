@@ -1,4 +1,4 @@
-"""CDN stack — CloudFront distribution, S3 static hosting, OAI."""
+"""CDN stack — CloudFront distribution, S3 static hosting, API proxy."""
 
 from aws_cdk import (
     CfnOutput,
@@ -7,24 +7,30 @@ from aws_cdk import (
     Stack,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_elasticloadbalancingv2 as elbv2,
     aws_s3 as s3,
-    aws_s3_deployment as s3deploy,
 )
 from constructs import Construct
 
 
 class CdnStack(Stack):
-    """CloudFront distribution for the React frontend.
+    """CloudFront distribution serving both the React frontend and proxying
+    API requests to the ALB.
 
-    - S3 bucket: private, serves static assets only through CloudFront
-    - OAI: Origin Access Identity restricts direct S3 access
-    - CloudFront: HTTPS, gzip/brotli compression, SPA routing
+    - ``/*``       → S3 bucket (static frontend assets)
+    - ``/api/*``   → ALB (backend API)
+    - ``/ws/*``    → ALB (WebSocket)
+
+    This ensures everything goes through CloudFront's HTTPS — no mixed
+    content issues between the frontend and backend.
     """
 
     def __init__(
         self,
         scope: Construct,
         construct_id: str,
+        *,
+        alb: elbv2.IApplicationLoadBalancer,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -44,15 +50,24 @@ class CdnStack(Stack):
         )
 
         # =====================================================================
-        # Origin Access Identity
+        # Origins
         # =====================================================================
 
-        oai = cloudfront.OriginAccessIdentity(
-            self,
-            "FrontendOai",
-            comment="OAI for VSWE frontend bucket",
+        s3_origin = origins.S3BucketOrigin.with_origin_access_control(
+            self.frontend_bucket,
         )
-        self.frontend_bucket.grant_read(oai)
+
+        alb_origin = origins.HttpOrigin(
+            alb.load_balancer_dns_name,
+            protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+        )
+
+        # =====================================================================
+        # Cache Policies
+        # =====================================================================
+
+        # API: no caching — use the managed CachingDisabled policy
+        api_cache_policy = cloudfront.CachePolicy.CACHING_DISABLED
 
         # =====================================================================
         # CloudFront Distribution
@@ -63,11 +78,9 @@ class CdnStack(Stack):
             "FrontendDistribution",
             comment="VSWE Frontend",
             default_root_object="index.html",
+            # Default: serve static frontend from S3
             default_behavior=cloudfront.BehaviorOptions(
-                origin=origins.S3Origin(
-                    self.frontend_bucket,
-                    origin_access_identity=oai,
-                ),
+                origin=s3_origin,
                 viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                 allowed_methods=cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
                 cached_methods=cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
@@ -75,11 +88,9 @@ class CdnStack(Stack):
                 compress=True,
             ),
             additional_behaviors={
+                # Static assets with long cache
                 "/assets/*": cloudfront.BehaviorOptions(
-                    origin=origins.S3Origin(
-                        self.frontend_bucket,
-                        origin_access_identity=oai,
-                    ),
+                    origin=s3_origin,
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     cache_policy=cloudfront.CachePolicy(
                         self,
@@ -92,6 +103,22 @@ class CdnStack(Stack):
                         enable_accept_encoding_brotli=True,
                     ),
                     compress=True,
+                ),
+                # API proxy → ALB (no caching)
+                "/api/*": cloudfront.BehaviorOptions(
+                    origin=alb_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=api_cache_policy,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                ),
+                # WebSocket proxy → ALB
+                "/ws/*": cloudfront.BehaviorOptions(
+                    origin=alb_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=api_cache_policy,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
                 ),
             },
             # SPA fallback — return index.html for any 403/404 from S3

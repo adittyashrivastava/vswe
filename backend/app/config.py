@@ -1,4 +1,18 @@
+import json
+import os
+
 from pydantic_settings import BaseSettings
+
+# If VSWE_SECRETS is set (production — injected by ECS from SSM),
+# unpack the JSON blob into individual env vars so pydantic-settings
+# picks them up automatically.
+_secrets_json = os.environ.get("VSWE_SECRETS")
+if _secrets_json:
+    try:
+        for key, value in json.loads(_secrets_json).items():
+            os.environ.setdefault(key.upper(), str(value))
+    except (json.JSONDecodeError, AttributeError):
+        pass
 
 
 class Settings(BaseSettings):

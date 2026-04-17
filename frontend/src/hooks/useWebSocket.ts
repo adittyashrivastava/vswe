@@ -12,6 +12,7 @@ interface UseWebSocketReturn {
   statusText: string | null;
   streamingContent: string;
   isProcessing: boolean;
+  pendingPlan: string | null;
 }
 
 export function useWebSocket(sessionId: string | undefined): UseWebSocketReturn {
@@ -23,6 +24,7 @@ export function useWebSocket(sessionId: string | undefined): UseWebSocketReturn 
   const [statusText, setStatusText] = useState<string | null>(null);
   const [streamingContent, setStreamingContent] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -95,6 +97,15 @@ export function useWebSocket(sessionId: string | undefined): UseWebSocketReturn 
           setStreamingContent("");
           break;
 
+        case "plan_review":
+          if (event.data.plan) {
+            setPendingPlan(event.data.plan);
+          }
+          setStreamingContent("");
+          setStatusText(null);
+          setIsProcessing(false);
+          break;
+
         case "done":
           if (event.data.message) {
             // Attach any remaining tool calls to the final message
@@ -147,6 +158,7 @@ export function useWebSocket(sessionId: string | undefined): UseWebSocketReturn 
       setMessages((prev) => [...prev, userMessage]);
       setCompletedToolCalls([]);
       setActiveToolCalls([]);
+      setPendingPlan(null);
       wsManager.send(content);
     },
     [sessionId],
@@ -162,5 +174,6 @@ export function useWebSocket(sessionId: string | undefined): UseWebSocketReturn 
     statusText,
     streamingContent,
     isProcessing,
+    pendingPlan,
   };
 }

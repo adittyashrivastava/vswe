@@ -41,6 +41,7 @@ export function ChatInput({ onSend, disabled }: Props) {
       <div className="flex items-end gap-2 max-w-4xl mx-auto">
         <textarea
           ref={textareaRef}
+          data-chat-input
           value={value}
           onChange={(e) => {
             setValue(e.target.value);

@@ -113,6 +113,10 @@ export function getJob(id: string): Promise<Job> {
   return request(`/jobs/${id}`);
 }
 
+export function getJobLogs(jobId: string): Promise<{ job_id: string; logs: string[] }> {
+  return request(`/jobs/${jobId}/logs`);
+}
+
 // Costs
 export function getCostSummary(from: string, to: string): Promise<CostSummary> {
   return request(`/costs/summary?from_date=${from}&to_date=${to}`);
@@ -136,4 +140,23 @@ export function updateConfig(scope: string, data: Record<string, unknown>): Prom
     method: "PUT",
     body: JSON.stringify(data),
   });
+}
+
+// Repo config status
+export interface RepoConfigStatus {
+  full_name: string;
+  private: boolean;
+  enabled: boolean;
+}
+
+export function getReposStatus(): Promise<RepoConfigStatus[]> {
+  return request("/config/repos/status");
+}
+
+export function enableRepo(repoFullName: string): Promise<Record<string, unknown>> {
+  return updateConfig(`repo:${repoFullName}`, { enabled: true });
+}
+
+export function disableRepo(repoFullName: string): Promise<Record<string, unknown>> {
+  return updateConfig(`repo:${repoFullName}`, { enabled: false });
 }

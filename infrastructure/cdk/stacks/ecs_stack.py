@@ -4,6 +4,7 @@ from aws_cdk import (
     Duration,
     Stack,
     aws_ec2 as ec2,
+    aws_ecr_assets as ecr_assets,
     aws_ecs as ecs,
     aws_efs as efs,
     aws_elasticloadbalancingv2 as elbv2,
@@ -11,6 +12,7 @@ from aws_cdk import (
     aws_logs as logs,
     aws_dynamodb as dynamodb,
     aws_s3 as s3,
+    aws_ssm as ssm,
 )
 from constructs import Construct
 
@@ -32,6 +34,7 @@ class EcsStack(Stack):
         efs_access_point: efs.IAccessPoint,
         dynamo_tables: list[dynamodb.ITable],
         artifacts_bucket: s3.IBucket,
+        sqs_queue_url: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -86,9 +89,15 @@ class EcsStack(Stack):
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
         )
 
-        # Grant DynamoDB access
+        # Grant DynamoDB access (read/write on individual tables + ListTables for startup)
         for table in dynamo_tables:
             table.grant_read_write_data(task_role)
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:ListTables", "dynamodb:DescribeTable"],
+                resources=["*"],
+            )
+        )
 
         # Grant S3 access
         artifacts_bucket.grant_read_write(task_role)
@@ -106,14 +115,22 @@ class EcsStack(Stack):
             )
         )
 
-        # Allow submitting Batch jobs (agent needs this)
+        # Allow running ECS tasks (agent spawns job tasks)
         task_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
-                    "batch:SubmitJob",
-                    "batch:DescribeJobs",
-                    "batch:ListJobs",
-                    "batch:TerminateJob",
+                    "ecs:RunTask",
+                    "ecs:StopTask",
+                    "ecs:DescribeTasks",
+                    "ecs:ListTasks",
+                    "ecs:TagResource",
+                    "iam:PassRole",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                    "logs:GetLogEvents",
+                    "sqs:ReceiveMessage",
+                    "sqs:DeleteMessage",
+                    "sqs:GetQueueAttributes",
                 ],
                 resources=["*"],
             )
@@ -134,9 +151,19 @@ class EcsStack(Stack):
             volumes=[efs_volume_config],
         )
 
+        # Private subnet IDs for job task networking
+        private_subnet_ids = ",".join(
+            s.subnet_id for s in vpc.private_subnets
+        )
+        # Default security group for job tasks
+        default_sg = ec2.SecurityGroup.from_security_group_id(
+            self, "DefaultSg",
+            vpc.vpc_default_security_group,
+        )
+
         api_container = self.api_task_def.add_container(
             "api",
-            image=ecs.ContainerImage.from_registry("vswe/api:latest"),
+            image=ecs.ContainerImage.from_asset("../../backend", platform=ecr_assets.Platform.LINUX_AMD64),
             logging=ecs.LogDrivers.aws_logs(
                 stream_prefix="vswe-api",
                 log_retention=logs.RetentionDays.ONE_MONTH,
@@ -146,9 +173,31 @@ class EcsStack(Stack):
                 "AWS_REGION": self.region,
                 "EFS_MOUNT_PATH": "/efs",
                 "S3_BUCKET": artifacts_bucket.bucket_name,
+                # SQS consumer
+                "VSWE_SQS_QUEUE_URL": sqs_queue_url,
+                # Job submission
+                "VSWE_ECS_CLUSTER": "vswe-cluster",
+                "VSWE_JOB_TASK_DEF": "vswe-job",
+                "VSWE_PRIVATE_SUBNETS": private_subnet_ids,
+                "VSWE_SECURITY_GROUPS": vpc.vpc_default_security_group,
+            },
+            secrets={
+                # All secrets from a single SSM parameter (JSON blob).
+                # Create it with:
+                #   aws ssm put-parameter --name /vswe/secrets --type SecureString \
+                #     --value '{"ANTHROPIC_API_KEY":"sk-...","JWT_SECRET":"...","GITHUB_APP_ID":"...",...}'
+                #
+                # Individual keys are extracted by the app at startup from
+                # the VSWE_SECRETS env var.
+                "VSWE_SECRETS": ecs.Secret.from_ssm_parameter(
+                    ssm.StringParameter.from_secure_string_parameter_attributes(
+                        self, "VsweSecrets",
+                        parameter_name="/vswe/secrets",
+                    )
+                ),
             },
             health_check=ecs.HealthCheck(
-                command=["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+                command=["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
                 interval=Duration.seconds(30),
                 timeout=Duration.seconds(5),
                 retries=3,
@@ -157,7 +206,7 @@ class EcsStack(Stack):
         )
 
         api_container.add_port_mappings(
-            ecs.PortMapping(container_port=8000, protocol=ecs.Protocol.TCP)
+            ecs.PortMapping(container_port=8080, protocol=ecs.Protocol.TCP)
         )
 
         api_container.add_mount_points(
@@ -172,10 +221,14 @@ class EcsStack(Stack):
         # Agent Task Definition (spawned on-demand)
         # =====================================================================
 
-        self.agent_task_def = ecs.FargateTaskDefinition(
+        # =====================================================================
+        # Job Task Definition (on-demand compute for scripts/training)
+        # =====================================================================
+
+        self.job_task_def = ecs.FargateTaskDefinition(
             self,
-            "AgentTaskDef",
-            family="vswe-agent",
+            "JobTaskDef",
+            family="vswe-job",
             cpu=1024,
             memory_limit_mib=2048,
             execution_role=execution_role,
@@ -183,22 +236,20 @@ class EcsStack(Stack):
             volumes=[efs_volume_config],
         )
 
-        agent_container = self.agent_task_def.add_container(
-            "agent",
-            image=ecs.ContainerImage.from_registry("vswe/agent:latest"),
+        job_container = self.job_task_def.add_container(
+            "job",
+            image=ecs.ContainerImage.from_asset("../../training", platform=ecr_assets.Platform.LINUX_AMD64),
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="vswe-agent",
+                stream_prefix="vswe-job",
                 log_retention=logs.RetentionDays.ONE_MONTH,
             ),
             environment={
                 "ENV": "production",
                 "AWS_REGION": self.region,
-                "EFS_MOUNT_PATH": "/efs",
-                "S3_BUCKET": artifacts_bucket.bucket_name,
             },
         )
 
-        agent_container.add_mount_points(
+        job_container.add_mount_points(
             ecs.MountPoint(
                 container_path="/efs",
                 source_volume="vswe-efs",
@@ -283,7 +334,7 @@ class EcsStack(Stack):
 
         target_group = listener.add_targets(
             "ApiTarget",
-            port=8000,
+            port=8080,
             targets=[self.api_service],
             health_check=elbv2.HealthCheck(
                 path="/health",
@@ -319,3 +370,9 @@ class EcsStack(Stack):
             scale_in_cooldown=Duration.seconds(300),
             scale_out_cooldown=Duration.seconds(60),
         )
+
+        # FRONTEND_URL, BACKEND_URL, and CORS_ORIGINS are NOT set here.
+        # Since CloudFront proxies /api/* to the ALB, the frontend and
+        # backend share the same domain. These are set in SSM secrets
+        # (or the push-secrets script) after the first deploy when the
+        # CloudFront domain is known.

@@ -8,6 +8,7 @@ import { MessageList } from "./MessageList";
 import { ChatInput } from "./ChatInput";
 import { RepoSelector } from "./RepoSelector";
 import { ModelSelector } from "./ModelSelector";
+import { PlanReviewCard } from "./PlanReviewCard";
 import { StepIndicator } from "./StepIndicator";
 import { ToolCallBlock } from "./ToolCallBlock";
 import type { Message } from "@/types/message";
@@ -24,6 +25,7 @@ export function ChatView() {
     statusText,
     streamingContent,
     isProcessing,
+    pendingPlan,
   } = useWebSocket(sessionId);
 
   // Load existing messages with reverse-chronological pagination.
@@ -165,6 +167,24 @@ export function ChatView() {
                 </div>
               )}
             </div>
+          )}
+
+          {/* Plan review card — shown when agent submits a plan for approval */}
+          {pendingPlan && (
+            <PlanReviewCard
+              plan={pendingPlan}
+              onApprove={() => sendMessage("[PLAN_APPROVED]")}
+              onRequestChanges={() => {
+                const input = document.querySelector<HTMLTextAreaElement>(
+                  "[data-chat-input]",
+                );
+                if (input) {
+                  input.focus();
+                  input.placeholder =
+                    "Describe what you'd like changed in the plan...";
+                }
+              }}
+            />
           )}
         </div>
       </div>

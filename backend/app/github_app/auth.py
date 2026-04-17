@@ -40,4 +40,8 @@ def generate_app_jwt(app_id: str, private_key: str) -> str:
         "iss": app_id,
     }
 
+    # .env files store the PEM key with literal \n — convert to real newlines
+    if "\\n" in private_key:
+        private_key = private_key.replace("\\n", "\n")
+
     return jwt.encode(payload, private_key, algorithm="RS256")
